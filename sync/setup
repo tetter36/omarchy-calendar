@@ -2,7 +2,8 @@
 # Interactive onboarding for the calendar sync.
 #
 # With --ics it only asks for secret iCal addresses. With --caldav it asks for
-# a CalDAV account such as iCloud. Otherwise it sets up the gws backend. Automates: GCP project creation, Calendar API enablement, gws profile
+# a CalDAV account such as iCloud. With --outlook it signs in to Outlook or
+# Microsoft 365 and adds it beside whatever is set up already. Otherwise it sets up the gws backend. Automates: GCP project creation, Calendar API enablement, gws profile
 # layout, the scoped login, and the systemd timer.
 # Cannot automate: the OAuth consent screen, declaring the calendar scope,
 # publishing to production, and creating the Desktop OAuth client. Google
@@ -20,15 +21,22 @@ set -euo pipefail
 # --caldav skips Google entirely too: it asks for a CalDAV server (iCloud by
 # default), a username and an app password, keeps the password in the
 # keyring, and reads and writes that server.
+#
+# --outlook adds Outlook or Microsoft 365 over Microsoft Graph, read and
+# write, next to the backend the config already names. It needs an app
+# registration of your own in Microsoft Entra, and keeps the sign-in in the
+# keyring. Running another setup afterwards keeps Outlook in the list.
 WRITE=0
 ICS=0
 CALDAV=0
+OUTLOOK=0
 for arg in "$@"; do
   case "$arg" in
     --write) WRITE=1 ;;
     --ics) ICS=1 ;;
     --caldav) CALDAV=1 ;;
-    *) echo "unknown option: $arg (expected --write, --ics or --caldav)"; exit 2 ;;
+    --outlook) OUTLOOK=1 ;;
+    *) echo "unknown option: $arg (expected --write, --ics, --caldav or --outlook)"; exit 2 ;;
   esac
 done
 
@@ -140,9 +148,13 @@ if path.exists():
         config = json.loads(path.read_text())
     except ValueError:
         config = {}
-config["backend"] = "ics"
+# Outlook, added with --outlook, stays beside the backend set up here.
+previous = config.get("backend")
+outlook = previous == "graph" or (isinstance(previous, list) and "graph" in previous)
+config["backend"] = ["ics", "graph"] if outlook else "ics"
 config["ics"] = [{"url": url.strip()} for url in urls]
-config["write"] = False
+if not outlook:
+    config["write"] = False
 if identity:
     config["identity"] = identity
 # The file now holds the secret addresses.
@@ -189,7 +201,10 @@ if lookup:
     account["passwordCommand"] = ["secret-tool", "lookup", *lookup]
 else:
     account["password"] = password
-config["backend"] = "caldav"
+# Outlook, added with --outlook, stays beside the backend set up here.
+previous = config.get("backend")
+outlook = previous == "graph" or (isinstance(previous, list) and "graph" in previous)
+config["backend"] = ["caldav", "graph"] if outlook else "caldav"
 config["caldav"] = account
 config["write"] = write
 if "@" in username and not config.get("identity"):
@@ -297,6 +312,147 @@ EOF
   exit 0
 }
 
+setup_outlook() {
+  step "Reading and writing Outlook over Microsoft Graph"
+  command -v secret-tool >/dev/null || {
+    echo "  secret-tool keeps the sign-in in your keyring: sudo pacman -S libsecret"
+    exit 1
+  }
+
+  # A second run offers what the config already holds.
+  local current_client current_tenant
+  current_client=$(python3 -c '
+import json, pathlib, sys
+try:
+    print((json.loads(pathlib.Path(sys.argv[1]).read_text()).get("graph") or {}).get(sys.argv[2]) or "")
+except (OSError, ValueError, AttributeError):
+    print("")
+' "$CONFIG" clientId 2>/dev/null || true)
+  current_tenant=$(python3 -c '
+import json, pathlib, sys
+try:
+    print((json.loads(pathlib.Path(sys.argv[1]).read_text()).get("graph") or {}).get(sys.argv[2]) or "")
+except (OSError, ValueError, AttributeError):
+    print("")
+' "$CONFIG" tenant 2>/dev/null || true)
+
+  cat <<'EOF'
+
+  Outlook needs an app registration of your own, like Google needs a client
+  of your own. A work or school account needs an administrator for it.
+
+  1. Open https://entra.microsoft.com > App registrations > New registration
+       Name:                     Omarchy Calendar
+       Supported account types:  Accounts in this organizational directory only
+       Redirect URI:             leave empty
+     Register.
+  2. Authentication > Allow public client flows > Yes > Save.
+     Without it the sign-in below is refused.
+  3. API permissions > Add a permission > Microsoft Graph >
+     Delegated permissions > Calendars.ReadWrite > Add permissions.
+     (Calendars.Read is enough if you will not edit events here.)
+     Then "Grant admin consent", so nobody is asked again.
+  4. Overview: copy the Application (client) ID and the Directory (tenant) ID.
+
+EOF
+  local client_id tenant
+  read -r -p "  Application (client) ID${current_client:+ [$current_client]}: " client_id || true
+  client_id=${client_id:-$current_client}
+  [ -n "$client_id" ] || { echo "  No client ID given, nothing changed."; exit 1; }
+  # An app for one organisation signs in at that organisation's own address.
+  read -r -p "  Directory (tenant) ID${current_tenant:+ [$current_tenant]}: " tenant || true
+  tenant=${tenant:-$current_tenant}
+  [ -n "$tenant" ] || { echo "  No tenant ID given, nothing changed."; exit 1; }
+
+  # Writing is one switch for every backend in the config, so a second run
+  # must not turn it off behind the user's back.
+  if [ "$WRITE" = 0 ]; then
+    local current_write=1
+    if [ -f "$CONFIG" ]; then
+      current_write=$(python3 -c '
+import json, pathlib, sys
+try:
+    print("1" if json.loads(pathlib.Path(sys.argv[1]).read_text()).get("write") is True else "0")
+except (OSError, ValueError, AttributeError):
+    print("0")
+' "$CONFIG" 2>/dev/null || echo 0)
+    fi
+    if [ -t 0 ]; then
+      if [ "$current_write" = 1 ]; then
+        printf '\n  Create and edit events from the widget? [Y/n] '
+        read -r answer || true
+        case "${answer:-}" in n|N|no|No|NO) WRITE=0 ;; *) WRITE=1 ;; esac
+      else
+        printf '\n  Create and edit events from the widget? [y/N] '
+        read -r answer || true
+        case "${answer:-}" in y|Y|yes|Yes|YES) WRITE=1 ;; esac
+      fi
+    else
+      WRITE=$current_write
+    fi
+  fi
+
+  step "Signing in to Microsoft"
+  local login_args=(login --client-id "$client_id" --tenant "$tenant")
+  [ "$WRITE" = 1 ] && login_args+=(--write)
+  # No .pyc: the shell reloads the plugin when its folder changes.
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" python3 -m omarchy_calendar_sync.graph "${login_args[@]}" || {
+    echo "  The sign-in failed, see above. $CONFIG is unchanged."
+    exit 1
+  }
+
+  mkdir -p "$(dirname "$CONFIG")"
+  # The new config replaces the current one only after a test sync passes.
+  local candidate
+  candidate=$(mktemp "$CONFIG.XXXXXX")
+  trap 'rm -f "$candidate"' EXIT
+  python3 - "$CONFIG" "$candidate" "$client_id" "$tenant" "$WRITE" <<'PYEOF'
+import json, os, pathlib, sys
+
+path, candidate = pathlib.Path(sys.argv[1]), sys.argv[2]
+client_id, tenant, write = sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+config = {}
+if path.exists():
+    try:
+        config = json.loads(path.read_text())
+    except ValueError:
+        config = {}
+# Outlook goes beside what is set up, not in its place. A config that names
+# no backend reads Google only if the Google setup has been run.
+previous = config.get("backend")
+if isinstance(previous, list):
+    names = [str(name) for name in previous]
+elif previous:
+    names = [str(previous)]
+else:
+    names = ["gws"] if config.get("gwsPath") else []
+names = [name for name in names if name != "graph"] + ["graph"]
+config["backend"] = names if len(names) > 1 else "graph"
+config["graph"] = {"clientId": client_id, "tenant": tenant}
+config["write"] = write
+fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(json.dumps(config, indent=2) + "\n")
+os.chmod(candidate, 0o600)
+print("  backend set to", json.dumps(config["backend"]))
+print("  write set to", write)
+PYEOF
+
+  step "Testing the sync"
+  "$SYNC_BIN" --config "$candidate" || {
+    echo "  The sync failed, see above. $CONFIG is unchanged."
+    exit 1
+  }
+  mv -f "$candidate" "$CONFIG"
+  if [ "$WRITE" = 1 ]; then
+    echo "  Writing is on for every backend. If Google was signed in to read"
+    echo "  only, run this setup once more with --write to let it write too."
+  fi
+
+  install_timer_and_sync
+  exit 0
+}
+
 # `read` returns non-zero at EOF, which under `set -e` would end the script
 # silently at the first prompt whenever stdin is not a terminal.
 pause() {
@@ -308,6 +464,7 @@ pause() {
   read -r _ || true
 }
 
+[ "$OUTLOOK" = 1 ] && setup_outlook
 [ "$ICS" = 1 ] && setup_ics
 [ "$CALDAV" = 1 ] && setup_caldav
 
@@ -628,12 +785,15 @@ if path.exists():
         config = {}
 # This flow sets up the Google Cloud sync, so it must also select it.
 # Without this line, a config left by setup --ics keeps reading the feeds.
-config["backend"] = "gws"
+# Outlook, added with --outlook, stays beside the backend set up here.
+previous = config.get("backend")
+outlook = previous == "graph" or (isinstance(previous, list) and "graph" in previous)
+config["backend"] = ["gws", "graph"] if outlook else "gws"
 config["gwsPath"] = gws_path
 config["profile"] = profile
 config["write"] = write
 path.write_text(json.dumps(config, indent=2) + "\n")
-print("  backend set to gws")
+print("  backend set to", json.dumps(config["backend"]))
 print("  gwsPath set to", gws_path)
 print("  profile set to", profile)
 print("  write set to", write)

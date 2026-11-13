@@ -14,9 +14,11 @@ from .caldav import Caldav
 from .caldir import Caldir
 from .eds import Eds
 from .errors import SyncError
+from .graph import Graph
 from .gws import Gws
 from .ics import Ics
 from .localzone import resolve_local_timezone
+from .multi import Multi
 
 EXIT_OK = 0
 EXIT_SYNC_FAILED = 1
@@ -154,6 +156,9 @@ def run(client, cfg, now, out_path, local_tz):
             # What the form offers that this calendar cannot store.
             if c.get("lacks"):
                 entry["lacks"] = list(c["lacks"])
+            # What the form's video switch adds, when it is not Google Meet.
+            if c.get("video"):
+                entry["video"] = str(c["video"])
             writable.append(entry)
     # Only for the event form, so only when writing is on.
     guests = []
@@ -173,8 +178,26 @@ def run(client, cfg, now, out_path, local_tz):
 
 
 def build_client(cfg, local_tz=None):
-    """The calendar source named by the config."""
-    backend = str(cfg.get("backend") or "gws").strip().lower()
+    """The calendar source named by the config: one backend, or a list of
+    them read and written as one."""
+    named = cfg.get("backend")
+    if not isinstance(named, (list, tuple)):
+        named = named or "gws"
+    else:
+        names = []
+        for name in named:
+            name = str(name).strip().lower()
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            raise config_module.ConfigError("backend is an empty list")
+        if len(names) == 1:
+            return _build_one(names[0], cfg, local_tz)
+        return Multi([_build_one(name, cfg, local_tz) for name in names])
+    return _build_one(str(named).strip().lower(), cfg, local_tz)
+
+
+def _build_one(backend, cfg, local_tz):
     if backend == "gws":
         return Gws(cfg["profile"], binary=cfg["gwsPath"])
     if backend == "eds":
@@ -185,8 +208,11 @@ def build_client(cfg, local_tz=None):
         return Caldir(binary=cfg["caldirPath"], pull=bool(cfg.get("caldirPull")))
     if backend == "caldav":
         return Caldav(cfg.get("caldav"), identity=cfg.get("identity", ""), local_tz=local_tz)
+    if backend == "graph":
+        return Graph(cfg.get("graph"), local_tz=local_tz)
     raise config_module.ConfigError(
-        "unknown backend %r; expected \"gws\", \"eds\", \"ics\", \"caldir\" or \"caldav\"" % backend
+        "unknown backend %r; expected \"gws\", \"eds\", \"ics\", \"caldir\", \"caldav\" "
+        "or \"graph\", or a list of them" % backend
     )
 
 

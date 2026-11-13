@@ -49,6 +49,8 @@ Column {
   // panel can invite (see the sync's caldav.py), so the form leaves them out.
   readonly property bool hasGuests: !Model.calendarLacks(root.calendar, "guests")
   readonly property bool hasMeet: !Model.calendarLacks(root.calendar, "meet")
+  // An Outlook calendar's video switch adds a Teams meeting, not a Meet.
+  readonly property bool teams: !!root.calendar && root.calendar.video === "teams"
   readonly property bool hasColor: !Model.calendarLacks(root.calendar, "color")
 
   spacing: Style.space(8)
@@ -291,7 +293,7 @@ Column {
   FieldRow {
     id: meetRow
     visible: root.hasMeet
-    label: root.tr("form.meet")
+    label: root.teams ? "Teams" : root.tr("form.meet")
     ToggleSwitch {
       id: meetToggle
       checked: root.form.meet === true
@@ -305,8 +307,8 @@ Column {
       // A Meet link from Google, or the promise of one on save.
       textFormat: Text.PlainText
       text: root.form.meet
-        ? (root.form.meetUrl || root.tr("form.meetOnSave"))
-        : root.tr("form.meetAdd")
+        ? (root.form.meetUrl || root.tr(root.teams ? "form.meetOnSaveTeams" : "form.meetOnSave"))
+        : root.tr(root.teams ? "form.meetAddTeams" : "form.meetAdd")
       wrapMode: Text.Wrap
       maximumLineCount: 2
       elide: Text.ElideRight

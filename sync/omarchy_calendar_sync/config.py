@@ -17,7 +17,13 @@ DEFAULTS = {
     # feeds such as Google's secret address and needs nothing; "caldir" reads
     # the caldir CLI and reuses its sign-in; "caldav" reads and writes a
     # CalDAV server such as iCloud with an app password. See the README.
+    # "graph" reads and writes Outlook and Microsoft 365 over Microsoft
+    # Graph, with an app registration of your own. A list, such as
+    # ["gws", "graph"], reads and writes several as one.
     "backend": "gws",
+    # graph only: the app registration sync/setup --outlook signed in with.
+    # The sign-in itself is in the keyring, not here.
+    "graph": {"clientId": "", "tenant": "organizations"},
     # Opt-in. sync/setup --write sets it, together with the calendar.events
     # scope. Off, the sync publishes no writable calendars and the panel
     # shows no way to change an event.

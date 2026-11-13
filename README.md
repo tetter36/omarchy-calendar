@@ -432,6 +432,74 @@ Each save sends the event with the version the panel read, so a change made
 on another device in the meantime is refused rather than overwritten. Wait
 for the next sync, then try again.
 
+## Sync from Outlook or Microsoft 365
+
+> **Fork addition, not tested by the upstream author.** Covered by unit
+> tests against recorded shapes of Microsoft Graph's answers.
+
+Reads and writes Outlook calendars over Microsoft Graph, which is the only
+way to write them: Microsoft has no CalDAV, and a published iCal address is
+read only. Like the Google sync, it needs a client of your own.
+
+```bash
+~/.config/omarchy/plugins/tmn73.calendar/sync/setup --outlook
+```
+
+The setup prints the four steps in the Microsoft Entra admin centre: an
+app registration for your organisation only, with no redirect address;
+**Allow public client flows** turned on; the delegated permission
+`Calendars.ReadWrite` (or `Calendars.Read` to only read), with admin
+consent; and the two IDs to paste back. A work or school account needs an
+administrator for these. It then signs in with a code you type at
+microsoft.com/devicelogin, runs a test sync, and writes the config only if
+that passes.
+
+The sign-in is kept in your keyring with `secret-tool`, never in the config
+file, and is sent to `graph.microsoft.com` and `login.microsoftonline.com`
+only. The config holds the two IDs, which are not secrets:
+
+```json
+{
+  "backend": "graph",
+  "write": true,
+  "graph": { "clientId": "your application id", "tenant": "your tenant id" }
+}
+```
+
+The video switch in the event form adds a Teams meeting on an Outlook
+calendar, and its Join button and the bar's join action open it. What
+differs from Google:
+
+- Outlook decides whether guests get an email, so the panel's "notify
+  guests" answer is not sent.
+- A Teams meeting cannot be taken off an event once it has one. The panel
+  says so instead of saving.
+- An event holds one reminder: the earliest popup you set is kept.
+- Google's event colours and guest permissions are not stored.
+- A repeat rule Outlook has no word for (hourly, several days of the month)
+  is refused with a message.
+- Saving a changed description stores it as plain text.
+
+If your organisation expires sign-ins, the sync fails with "Your Outlook
+sign-in expired"; run the setup again.
+
+## Use several accounts at once
+
+`"backend"` may be a list. The calendars of each are read into the one
+events file, and a change made in the panel goes to the account that owns
+the event:
+
+```json
+{ "backend": ["gws", "graph"], "write": true }
+```
+
+`setup --outlook` adds Outlook beside whatever is set up, and the other
+setups keep Outlook in the list, so the order you run them in does not
+matter. `"write"` is one switch for all of them. A backend that fails, such
+as an expired sign-in, costs its own calendars until it is fixed, and the
+others keep syncing; `systemctl --user status omarchy-calendar-sync.service`
+shows which one was skipped.
+
 ## Use another source
 
 The widget has no idea Google exists. It reads one file and renders it:
