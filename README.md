@@ -445,14 +445,19 @@ read only. Like the Google sync, it needs a client of your own.
 ~/.config/omarchy/plugins/tmn73.calendar/sync/setup --outlook
 ```
 
-The setup prints the four steps in the Microsoft Entra admin centre: an
-app registration for your organisation only, with no redirect address;
-**Allow public client flows** turned on; the delegated permission
-`Calendars.ReadWrite` (or `Calendars.Read` to only read), with admin
-consent; and the two IDs to paste back. A work or school account needs an
-administrator for these. It then signs in with a code you type at
-microsoft.com/devicelogin, runs a test sync, and writes the config only if
-that passes.
+With the Azure CLI (`sudo pacman -S azure-cli`; the setup offers to
+install it) the setup creates the app registration itself: you sign in
+once as an administrator of your organisation, and it registers "Omarchy
+Calendar" for your organisation only, with the delegated permission
+`Calendars.ReadWrite` and admin consent. Without the Azure CLI, or with
+`--by-hand`, it prints the same steps for the Microsoft Entra admin centre
+and asks for the two IDs.
+
+It then opens your browser to pick the account, the way a desktop mail app
+does, runs a test sync, and writes the config only if that passes. On a
+machine with no browser, `--device-code` shows a code to type at
+microsoft.com/devicelogin from any other device. A later run reuses the
+registration, so signing in again is one browser sign-in.
 
 The sign-in is kept in your keyring with `secret-tool`, never in the config
 file, and is sent to `graph.microsoft.com` and `login.microsoftonline.com`

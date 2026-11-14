@@ -1,7 +1,12 @@
+import base64
+import hashlib
 import io
 import json
+import threading
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import date
 from zoneinfo import ZoneInfo
 
@@ -175,6 +180,126 @@ class TestSignIn(unittest.TestCase):
                         sleep=lambda _s: None, clock=lambda: 100)
         self.assertIn("Declined.", str(caught.exception))
         self.assertNotIn("Trace", str(caught.exception))
+
+
+class FakeCallback:
+    """The browser coming back, without a browser."""
+
+    redirect_uri = "http://localhost:4321"
+
+    def __init__(self, answer):
+        self.answer, self.closed = answer, False
+
+    def __call__(self, state):
+        self.state = state
+        return self
+
+    def wait(self, _seconds):
+        return self.answer
+
+    def close(self):
+        self.closed = True
+
+
+class TestBrowserSignIn(unittest.TestCase):
+    def sign_in(self, callback, http, store=None, write=True):
+        opened, out = [], io.StringIO()
+        try:
+            graph.login_browser(CLIENT, "contoso.example", write, http=http, store=store or FakeStore(),
+                                out=out, open_browser=opened.append, callback=callback, clock=lambda: 100)
+        finally:
+            self.opened, self.printed = opened, out.getvalue()
+
+    def test_the_browser_opens_at_microsoft_and_the_code_becomes_a_sign_in(self):
+        store, callback = FakeStore(), FakeCallback({"code": "C"})
+        http = FakeHttp((200, {"access_token": "A", "refresh_token": "R", "expires_in": 3600}))
+        self.sign_in(callback, http, store)
+        address = urllib.parse.urlsplit(self.opened[0])
+        asked = {key: values[0] for key, values in urllib.parse.parse_qs(address.query).items()}
+        self.assertEqual(address.netloc, "login.microsoftonline.com")
+        self.assertEqual(address.path, "/contoso.example/oauth2/v2.0/authorize")
+        self.assertEqual(asked["redirect_uri"], "http://localhost:4321")
+        self.assertEqual(asked["state"], callback.state)
+        self.assertEqual(asked["code_challenge_method"], "S256")
+        self.assertIn("Calendars.ReadWrite", asked["scope"])
+        self.assertIn("offline_access", asked["scope"])
+        self.assertIn(self.opened[0], self.printed)
+        sent = {key: values[0] for key, values in urllib.parse.parse_qs(http.calls[0][3].decode()).items()}
+        self.assertEqual(sent["grant_type"], "authorization_code")
+        self.assertEqual(sent["code"], "C")
+        self.assertEqual(sent["redirect_uri"], "http://localhost:4321")
+        # The verifier sent with the code is the one the challenge was made from.
+        digest = hashlib.sha256(sent["code_verifier"].encode()).digest()
+        self.assertEqual(asked["code_challenge"], base64.urlsafe_b64encode(digest).rstrip(b"=").decode())
+        self.assertEqual(store.tokens["refresh_token"], "R")
+        self.assertTrue(callback.closed)
+
+    def test_reading_only_asks_to_read_only(self):
+        http = FakeHttp((200, {"access_token": "A", "refresh_token": "R", "expires_in": 3600}))
+        self.sign_in(FakeCallback({"code": "C"}), http, write=False)
+        self.assertIn("Calendars.Read+offline_access", self.opened[0])
+
+    def test_a_sign_in_microsoft_refused_says_why_and_asks_for_no_token(self):
+        http = FakeHttp()
+        callback = FakeCallback({"error": "access_denied",
+                                 "error_description": "AADSTS65004: User declined. Trace ID: abc"})
+        with self.assertRaises(graph.GraphSignInError) as caught:
+            self.sign_in(callback, http)
+        self.assertIn("User declined.", str(caught.exception))
+        self.assertEqual(http.calls, [])
+        self.assertTrue(callback.closed)
+
+    def test_nobody_signing_in_gives_up(self):
+        with self.assertRaises(graph.GraphSignInError) as caught:
+            self.sign_in(FakeCallback(None), FakeHttp())
+        self.assertIn("Nobody signed in", str(caught.exception))
+
+    def test_a_reply_with_no_lasting_sign_in_is_not_kept(self):
+        store = FakeStore()
+        http = FakeHttp((200, {"access_token": "A", "expires_in": 3600}))
+        with self.assertRaises(graph.GraphSignInError):
+            self.sign_in(FakeCallback({"code": "C"}), http, store)
+        self.assertIsNone(getattr(store, "tokens", None))
+
+
+class TestCallback(unittest.TestCase):
+    def setUp(self):
+        self.callback = graph._Callback("the-state")
+        self.addCleanup(self.callback.close)
+        self.assertRegex(self.callback.redirect_uri, r"^http://localhost:\d+$")
+        self.base = self.callback.redirect_uri.replace("localhost", "127.0.0.1")
+
+    def visit(self, query):
+        def fetch():
+            try:
+                with urllib.request.urlopen(self.base + "/?" + query, timeout=5) as response:
+                    self.reply = response.status, response.read().decode()
+            except urllib.error.HTTPError as error:
+                self.reply = error.code, ""
+                error.close()
+        thread = threading.Thread(target=fetch)
+        thread.start()
+        self.callback._server.handle_request()
+        thread.join()
+
+    def test_it_listens_on_this_machine_only(self):
+        self.assertEqual(self.callback._server.server_address[0], "127.0.0.1")
+
+    def test_the_answer_with_this_sign_ins_state_is_taken(self):
+        self.visit("code=C&state=the-state")
+        self.assertEqual(self.reply[0], 200)
+        self.assertIn("Signed in", self.reply[1])
+        self.assertEqual(self.callback.wait(1)["code"], "C")
+
+    def test_an_answer_with_another_state_is_refused(self):
+        self.visit("code=EVIL&state=other")
+        self.assertEqual(self.reply[0], 400)
+        self.assertIsNone(self.callback.answer)
+
+    def test_the_page_shows_nothing_that_was_sent(self):
+        self.visit("error=%3Cscript%3E&state=the-state")
+        self.assertIn("Not signed in", self.reply[1])
+        self.assertNotIn("script", self.reply[1])
 
 
 class TestReading(unittest.TestCase):

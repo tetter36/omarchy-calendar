@@ -26,7 +26,12 @@ set -euo pipefail
 # write, next to the backend the config already names. It needs an app
 # registration of your own in Microsoft Entra, and keeps the sign-in in the
 # keyring. Running another setup afterwards keeps Outlook in the list.
+# With the Azure CLI (az) it creates the registration itself; --by-hand
+# prints the steps for the Entra portal instead. The sign-in opens your
+# browser; --device-code shows a code to type on another machine instead.
 WRITE=0
+BY_HAND=0
+DEVICE_CODE=0
 ICS=0
 CALDAV=0
 OUTLOOK=0
@@ -36,7 +41,9 @@ for arg in "$@"; do
     --ics) ICS=1 ;;
     --caldav) CALDAV=1 ;;
     --outlook) OUTLOOK=1 ;;
-    *) echo "unknown option: $arg (expected --write, --ics, --caldav or --outlook)"; exit 2 ;;
+    --by-hand) BY_HAND=1 ;;
+    --device-code) DEVICE_CODE=1 ;;
+    *) echo "unknown option: $arg (expected --write, --ics, --caldav, --outlook, --by-hand or --device-code)"; exit 2 ;;
   esac
 done
 
@@ -312,6 +319,109 @@ EOF
   exit 0
 }
 
+OUTLOOK_APP_NAME="Omarchy Calendar"
+# Microsoft Graph, and its delegated permission Calendars.ReadWrite. The
+# setup asks Microsoft for the permission's id and falls back on this one.
+GRAPH_API=00000003-0000-0000-c000-000000000000
+CALENDARS_READWRITE=1ec239c2-d7c9-4623-a91a-a9775856bb36
+REGISTERED_CLIENT=""
+REGISTERED_TENANT=""
+
+outlook_steps_by_hand() {
+  cat <<'EOF'
+
+  Outlook needs an app registration of your own, like Google needs a client
+  of your own. A work or school account needs an administrator for it.
+  (With the Azure CLI installed, this setup does these steps for you.)
+
+  1. Open https://entra.microsoft.com > App registrations > New registration
+       Name:                     Omarchy Calendar
+       Supported account types:  Accounts in this organizational directory only
+       Redirect URI:             Public client/native (mobile & desktop)
+                                 http://localhost
+     Register.
+  2. Authentication > Allow public client flows > Yes > Save.
+  3. API permissions > Add a permission > Microsoft Graph >
+     Delegated permissions > Calendars.ReadWrite > Add permissions.
+     (Calendars.Read is enough if you will not edit events here.)
+     Then "Grant admin consent", so nobody is asked again.
+  4. Overview: copy the Application (client) ID and the Directory (tenant) ID.
+
+EOF
+}
+
+# True when az is there, after offering to install it at a terminal.
+outlook_have_az() {
+  command -v az >/dev/null && return 0
+  [ -t 0 ] && command -v pacman >/dev/null || return 1
+  printf '\n  The Azure CLI can create the app registration for you, so you never\n'
+  printf '  open the Entra portal. Install it now (sudo pacman -S azure-cli)? [Y/n] '
+  local answer
+  read -r answer || true
+  case "${answer:-}" in n|N|no|No|NO) return 1 ;; esac
+  sudo pacman -S --needed azure-cli || return 1
+  command -v az >/dev/null
+}
+
+# Creates (or finds and repairs) the app registration with the Azure CLI,
+# and leaves its ids in REGISTERED_CLIENT and REGISTERED_TENANT.
+outlook_register() {
+  step "Creating the app registration with the Azure CLI"
+  local account=""
+  account=$(az account show --query user.name -o tsv 2>/dev/null || true)
+  if [ -n "$account" ] && [ -t 0 ]; then
+    local answer
+    read -r -p "  The Azure CLI is signed in as $account. Use that account? [Y/n] " answer || true
+    case "${answer:-}" in n|N|no|No|NO) account="" ;; esac
+  fi
+  if [ -z "$account" ]; then
+    echo "  Sign in with an administrator of your Microsoft 365 organisation."
+    # A Microsoft 365 organisation often has no Azure subscription at all.
+    az login --allow-no-subscriptions --only-show-errors >/dev/null || return 1
+  fi
+  local tenant client scope
+  tenant=$(az account show --query tenantId -o tsv) || return 1
+  [ -n "$tenant" ] || return 1
+
+  client=$(az ad app list --display-name "$OUTLOOK_APP_NAME" --query '[0].appId' -o tsv 2>/dev/null || true)
+  if [ -n "$client" ]; then
+    echo "  Found the registration \"$OUTLOOK_APP_NAME\", bringing it up to date."
+    az ad app update --id "$client" --is-fallback-public-client true \
+      --public-client-redirect-uris http://localhost --only-show-errors >/dev/null || return 1
+  else
+    client=$(az ad app create --display-name "$OUTLOOK_APP_NAME" --sign-in-audience AzureADMyOrg \
+      --is-fallback-public-client true --public-client-redirect-uris http://localhost \
+      --query appId -o tsv --only-show-errors) || return 1
+    [ -n "$client" ] || return 1
+    echo "  Created the registration \"$OUTLOOK_APP_NAME\"."
+  fi
+
+  scope=$(az ad sp show --id "$GRAPH_API" \
+    --query "oauth2PermissionScopes[?value=='Calendars.ReadWrite'].id | [0]" -o tsv 2>/dev/null || true)
+  scope=${scope:-$CALENDARS_READWRITE}
+  az ad app permission add --id "$client" --api "$GRAPH_API" \
+    --api-permissions "$scope=Scope" --only-show-errors >/dev/null 2>&1 || return 1
+  # Consent is given to the app's service principal; one that exists is fine.
+  az ad sp create --id "$client" --only-show-errors >/dev/null 2>&1 || true
+
+  # A registration this new takes a moment to reach every Microsoft server.
+  local attempt consented=0
+  for attempt in 1 2 3 4 5 6; do
+    if az ad app permission admin-consent --id "$client" --only-show-errors >/dev/null 2>&1; then
+      consented=1
+      break
+    fi
+    sleep "${OUTLOOK_CONSENT_WAIT:-5}"
+  done
+  if [ "$consented" = 1 ]; then
+    echo "  Calendars.ReadWrite is allowed for the whole organisation."
+  else
+    echo "  Could not grant admin consent, so the sign-in will ask for it instead."
+  fi
+  REGISTERED_CLIENT=$client
+  REGISTERED_TENANT=$tenant
+}
+
 setup_outlook() {
   step "Reading and writing Outlook over Microsoft Graph"
   command -v secret-tool >/dev/null || {
@@ -336,33 +446,26 @@ except (OSError, ValueError, AttributeError):
     print("")
 ' "$CONFIG" tenant 2>/dev/null || true)
 
-  cat <<'EOF'
+  local client_id="" tenant=""
+  if [ -n "$current_client" ] && [ -n "$current_tenant" ]; then
+    # Registered before: only the sign-in is left, Enter keeps both.
+    echo "  Using the app registration from the last setup. Enter keeps it."
+  elif [ "$BY_HAND" = 0 ] && outlook_have_az; then
+    outlook_register || echo "  Could not create it for you, so here are the steps by hand."
+    client_id=$REGISTERED_CLIENT
+    tenant=$REGISTERED_TENANT
+  fi
 
-  Outlook needs an app registration of your own, like Google needs a client
-  of your own. A work or school account needs an administrator for it.
-
-  1. Open https://entra.microsoft.com > App registrations > New registration
-       Name:                     Omarchy Calendar
-       Supported account types:  Accounts in this organizational directory only
-       Redirect URI:             leave empty
-     Register.
-  2. Authentication > Allow public client flows > Yes > Save.
-     Without it the sign-in below is refused.
-  3. API permissions > Add a permission > Microsoft Graph >
-     Delegated permissions > Calendars.ReadWrite > Add permissions.
-     (Calendars.Read is enough if you will not edit events here.)
-     Then "Grant admin consent", so nobody is asked again.
-  4. Overview: copy the Application (client) ID and the Directory (tenant) ID.
-
-EOF
-  local client_id tenant
-  read -r -p "  Application (client) ID${current_client:+ [$current_client]}: " client_id || true
-  client_id=${client_id:-$current_client}
-  [ -n "$client_id" ] || { echo "  No client ID given, nothing changed."; exit 1; }
-  # An app for one organisation signs in at that organisation's own address.
-  read -r -p "  Directory (tenant) ID${current_tenant:+ [$current_tenant]}: " tenant || true
-  tenant=${tenant:-$current_tenant}
-  [ -n "$tenant" ] || { echo "  No tenant ID given, nothing changed."; exit 1; }
+  if [ -z "$client_id" ] || [ -z "$tenant" ]; then
+    [ -n "$current_client" ] && [ -n "$current_tenant" ] || outlook_steps_by_hand
+    read -r -p "  Application (client) ID${current_client:+ [$current_client]}: " client_id || true
+    client_id=${client_id:-$current_client}
+    [ -n "$client_id" ] || { echo "  No client ID given, nothing changed."; exit 1; }
+    # An app for one organisation signs in at that organisation's own address.
+    read -r -p "  Directory (tenant) ID${current_tenant:+ [$current_tenant]}: " tenant || true
+    tenant=${tenant:-$current_tenant}
+    [ -n "$tenant" ] || { echo "  No tenant ID given, nothing changed."; exit 1; }
+  fi
 
   # Writing is one switch for every backend in the config, so a second run
   # must not turn it off behind the user's back.
@@ -395,6 +498,7 @@ except (OSError, ValueError, AttributeError):
   step "Signing in to Microsoft"
   local login_args=(login --client-id "$client_id" --tenant "$tenant")
   [ "$WRITE" = 1 ] && login_args+=(--write)
+  [ "$DEVICE_CODE" = 1 ] && login_args+=(--device-code)
   # No .pyc: the shell reloads the plugin when its folder changes.
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" python3 -m omarchy_calendar_sync.graph "${login_args[@]}" || {
     echo "  The sign-in failed, see above. $CONFIG is unchanged."

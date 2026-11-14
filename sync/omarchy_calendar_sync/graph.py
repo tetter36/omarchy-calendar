@@ -4,8 +4,11 @@ Microsoft offers no CalDAV, and a published iCal feed is read only, so this
 talks to Graph directly over HTTPS with the standard library. Like the gws
 backend it needs a client of your own: an app registration in Microsoft
 Entra with the delegated permission Calendars.ReadWrite (Calendars.Read is
-enough without writing). sync/setup --outlook signs in with the device
-code flow, so no secret and no redirect address are involved.
+enough without writing). sync/setup --outlook creates it with the Azure
+CLI when that is installed, and signs in through the browser on this
+machine (authorization code with PKCE, back to a localhost address), or
+with a typed device code where there is no browser. No client secret is
+involved either way.
 
 The sign-in lives in the keyring (secret-tool), never in the config file.
 The bearer token goes to graph.microsoft.com only: redirects are not
@@ -22,8 +25,13 @@ calendar under "lacks". Three differences a person can notice:
 - An event holds one reminder, so the earliest popup is the one kept.
 """
 
+import base64
+import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -31,6 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import budget, event_form
@@ -50,6 +59,7 @@ PAGE_SIZE = 250
 # An access token lasts about an hour. One with less than this left is
 # renewed, so a run never starts with a token that ends halfway.
 RENEW_BEFORE_SECONDS = 300
+BROWSER_SIGN_IN_SECONDS = 300
 FALLBACK_COLOR = "#0078d4"
 DEFAULT_REMINDER_MINUTES = 15
 DEFAULT_PROVIDER = "teamsForBusiness"
@@ -66,6 +76,14 @@ BAD_REPEAT = "Outlook cannot store this repeat rule."
 ONLINE_KEY = "graphOnlineMeeting"
 
 LACKS = ["color"]
+
+_SIGNED_IN_PAGE = ("<!doctype html><meta charset=utf-8><title>Omarchy Calendar</title>"
+                   "<body style='font-family:sans-serif;margin:4em auto;max-width:30em'>"
+                   "<h2>Signed in</h2><p>Omarchy Calendar has your Outlook sign-in. "
+                   "You can close this tab.</p>")
+_NOT_SIGNED_IN_PAGE = _SIGNED_IN_PAGE.replace("Signed in", "Not signed in").replace(
+    "Omarchy Calendar has your Outlook sign-in. You can close this tab.",
+    "The sign-in did not finish. The terminal says why.")
 
 _CLIENT_ID = re.compile(r"^[0-9a-fA-F-]{32,40}$")
 _TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
@@ -234,19 +252,135 @@ def _kept(reply, previous, now):
     }
 
 
-def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.sleep, clock=time.time):
-    """Sign in with the device code flow and keep the result in the keyring.
+def _keep_first(status, reply, store, now):
+    """Keeps the reply that ends a sign-in, or says why there is none."""
+    if status != 200 or not isinstance(reply.get("access_token"), str) or not reply["access_token"]:
+        raise GraphSignInError("The sign-in did not finish: " + _reason(reply, status))
+    if not reply.get("refresh_token"):
+        raise GraphSignInError(
+            "Microsoft gave no lasting sign-in. Check that the app registration "
+            "allows public client flows.")
+    store.save(_kept(reply, None, now))
 
-    Prints the address and the code to type there, then waits for the
-    sign-in to finish in a browser, on this machine or any other.
+
+def _scope(write):
+    return "%s offline_access" % (WRITE_SCOPE if write else READ_SCOPE)
+
+
+class _Callback:
+    """Waits on this machine for the browser to come back from Microsoft.
+
+    Listens on the loopback address only, on a port the system picks, and
+    takes no answer but the one that carries this sign-in's state.
+    """
+
+    def __init__(self, state):
+        callback = self
+        self.answer = None
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                answer = {key: values[0] for key, values in query.items()}
+                if not hmac.compare_digest(answer.get("state", ""), state):
+                    self.send_error(400)
+                    return
+                callback.answer = answer
+                page = (_SIGNED_IN_PAGE if "code" in answer else _NOT_SIGNED_IN_PAGE).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def log_message(self, *_args):
+                pass
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self._server.timeout = 1
+        # Microsoft matches a localhost address whatever its port.
+        self.redirect_uri = "http://localhost:%d" % self._server.server_address[1]
+
+    def wait(self, seconds, clock=time.time):
+        give_up = clock() + seconds
+        while self.answer is None and clock() < give_up:
+            self._server.handle_request()
+        return self.answer
+
+    def close(self):
+        self._server.server_close()
+
+
+def _open_browser(address):
+    try:
+        subprocess.Popen(["xdg-open", address], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def login_browser(client_id, tenant, write, http=None, store=None, out=None,
+                  open_browser=None, callback=None, clock=time.time):
+    """Sign in through the browser on this machine: pick the account there
+    and the sign-in lands in the keyring, with nothing to type.
+
+    The authorization code flow with PKCE: the code Microsoft hands the
+    browser is worth nothing without the verifier that never leaves here.
     """
     http = http or _https
     store = store or Keyring(client_id)
     out = out or sys.stdout
-    scope = "%s offline_access" % (WRITE_SCOPE if write else READ_SCOPE)
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    listener = (callback or _Callback)(state)
+    try:
+        address = f"{LOGIN}/{_quote(tenant)}/oauth2/v2.0/authorize?" + urllib.parse.urlencode({
+            "client_id": client_id,
+            "response_type": "code",
+            "response_mode": "query",
+            "redirect_uri": listener.redirect_uri,
+            "scope": _scope(write),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "prompt": "select_account",
+        })
+        print("Your browser is opening for the Microsoft sign-in. If it does not, open:\n\n  %s\n"
+              % address, file=out, flush=True)
+        (open_browser or _open_browser)(address)
+        answer = listener.wait(BROWSER_SIGN_IN_SECONDS)
+    finally:
+        listener.close()
+    if answer is None:
+        raise GraphSignInError("Nobody signed in within %d minutes. Run the setup again."
+                               % (BROWSER_SIGN_IN_SECONDS // 60))
+    if not answer.get("code"):
+        raise GraphSignInError("The sign-in did not finish: " + _reason(answer, 0))
+    status, reply = _form(http, _token_url(tenant), {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": answer["code"],
+        "redirect_uri": listener.redirect_uri,
+        "code_verifier": verifier,
+    })
+    _keep_first(status, reply, store, clock())
+
+
+def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.sleep, clock=time.time):
+    """Sign in with the device code flow and keep the result in the keyring.
+
+    Prints the address and the code to type there, then waits for the
+    sign-in to finish in a browser, on this machine or any other. For a
+    machine with no browser of its own; login_browser is the usual way.
+    """
+    http = http or _https
+    store = store or Keyring(client_id)
+    out = out or sys.stdout
 
     status, reply = _form(http, f"{LOGIN}/{_quote(tenant)}/oauth2/v2.0/devicecode",
-                          {"client_id": client_id, "scope": scope})
+                          {"client_id": client_id, "scope": _scope(write)})
     code = reply.get("device_code")
     if status != 200 or not isinstance(code, str) or not code:
         raise GraphSignInError("Microsoft refused to start the sign-in: " + _reason(reply, status))
@@ -265,20 +399,14 @@ def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.
             "client_id": client_id,
             "device_code": code,
         })
-        if status == 200 and isinstance(reply.get("access_token"), str) and reply["access_token"]:
-            if not reply.get("refresh_token"):
-                raise GraphSignInError(
-                    "Microsoft gave no lasting sign-in. Check that the app registration "
-                    "allows public client flows.")
-            store.save(_kept(reply, None, clock()))
-            return
         problem = reply.get("error")
         if problem == "authorization_pending":
             continue
         if problem == "slow_down":
             interval += 5
             continue
-        raise GraphSignInError("The sign-in did not finish: " + _reason(reply, status))
+        _keep_first(status, reply, store, clock())
+        return
     raise GraphSignInError("The sign-in code expired before it was used. Run the setup again.")
 
 
@@ -907,10 +1035,17 @@ def main(argv=None):
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--tenant", default="organizations")
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--device-code", action="store_true",
+                        help="type a code in a browser on any machine, for one with no browser")
     args = parser.parse_args(argv)
+    # Without a desktop there is no browser to open here.
+    desktop = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
     try:
         client_id, tenant = _settings({"clientId": args.client_id, "tenant": args.tenant})
-        login(client_id, tenant, args.write)
+        if args.device_code or not desktop:
+            login(client_id, tenant, args.write)
+        else:
+            login_browser(client_id, tenant, args.write)
     except (ConfigError, SyncError) as error:
         print(str(error), file=sys.stderr)
         return 1
