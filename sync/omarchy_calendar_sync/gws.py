@@ -319,7 +319,7 @@ class Gws:
     def auth_hint(self, cfg):
         return (
             "if this is an auth error, run: "
-            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR=" + str(cfg["profile"]) + " "
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR=" + self.profile + " "
             "gws auth login --scopes "
             "https://www.googleapis.com/auth/calendar.readonly"
         )

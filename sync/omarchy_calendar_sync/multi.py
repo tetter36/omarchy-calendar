@@ -1,6 +1,7 @@
 """Several backends as one, so Google and Outlook share one events file.
 
-Set "backend" to a list in calendar-sync.json: ["gws", "graph"]. Each
+Set "backend" to a list in calendar-sync.json: ["gws", "graph"]. Several
+Google accounts ("profiles") are several backends here too. Each
 calendar belongs to the backend that listed it, and a change goes to that
 backend only. A backend that fails (an expired sign-in, a server that is
 down) costs its own calendars for that sync, not the others'.
@@ -21,7 +22,8 @@ class Multi:
         self._active = list(self._clients)
         self._owners = {}
         self._failed = []
-        self.SOURCE_NAME = "+".join(client.SOURCE_NAME for client in self._clients)
+        # Two accounts of one backend are still one name.
+        self.SOURCE_NAME = "+".join(dict.fromkeys(client.SOURCE_NAME for client in self._clients))
         self.can_write = any(getattr(client, "can_write", False) for client in self._clients)
 
     def version(self):
@@ -51,11 +53,19 @@ class Multi:
                 self._skip(client, error)
                 continue
             for calendar in listed:
-                if calendar["id"] in self._owners and self._owners[calendar["id"]] is not client:
-                    continue
-                self._owners[calendar["id"]] = client
                 if not getattr(client, "can_write", False):
                     calendar = {**calendar, "writable": False}
+                owner = self._owners.get(calendar["id"])
+                if owner is not None and owner is not client:
+                    # Two accounts see the same calendar: it shows once, and
+                    # belongs to an account that may write it if any may.
+                    place = next((i for i, one in enumerate(found) if one["id"] == calendar["id"]), None)
+                    if place is None or found[place].get("writable") or not calendar.get("writable"):
+                        continue
+                    found[place] = calendar
+                    self._owners[calendar["id"]] = client
+                    continue
+                self._owners[calendar["id"]] = client
                 found.append(calendar)
         if not self._active:
             raise first

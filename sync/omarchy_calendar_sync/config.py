@@ -38,6 +38,9 @@ DEFAULTS = {
     # Blank means responseStatus is left unset rather than guessed.
     "identity": "",
     "profile": str(Path.home() / ".config" / "gws-omarchy-calendar"),
+    # gws only: more Google accounts, each a folder holding its own sign-in,
+    # read and written beside "profile". sync/setup --add-google adds one.
+    "profiles": [],
     # Resolved to an absolute path by sync/setup. A systemd user service
     # does not inherit an interactive shell PATH, so relying on the bare
     # name works from a terminal and fails from the timer.

@@ -178,11 +178,12 @@ def run(client, cfg, now, out_path, local_tz):
 
 
 def build_client(cfg, local_tz=None):
-    """The calendar source named by the config: one backend, or a list of
-    them read and written as one."""
+    """The calendar source named by the config: one backend, or several
+    read and written as one. Several are a list of backends, more than
+    one Google account, or both."""
     named = cfg.get("backend")
     if not isinstance(named, (list, tuple)):
-        named = named or "gws"
+        names = [str(named or "gws").strip().lower()]
     else:
         names = []
         for name in named:
@@ -191,10 +192,26 @@ def build_client(cfg, local_tz=None):
                 names.append(name)
         if not names:
             raise config_module.ConfigError("backend is an empty list")
-        if len(names) == 1:
-            return _build_one(names[0], cfg, local_tz)
-        return Multi([_build_one(name, cfg, local_tz) for name in names])
-    return _build_one(str(named).strip().lower(), cfg, local_tz)
+    clients = []
+    for name in names:
+        if name == "gws":
+            clients.extend(Gws(profile, binary=cfg["gwsPath"]) for profile in _profiles(cfg))
+        else:
+            clients.append(_build_one(name, cfg, local_tz))
+    return clients[0] if len(clients) == 1 else Multi(clients)
+
+
+def _profiles(cfg):
+    """Every Google account's folder: "profile", then "profiles"."""
+    more = cfg.get("profiles") or []
+    if not isinstance(more, (list, tuple)) or not all(isinstance(one, str) and one.strip() for one in more):
+        raise config_module.ConfigError("profiles must be a list of folder paths")
+    found = []
+    for profile in [str(cfg["profile"]), *more]:
+        profile = profile.strip()
+        if profile not in found:
+            found.append(profile)
+    return found
 
 
 def _build_one(backend, cfg, local_tz):

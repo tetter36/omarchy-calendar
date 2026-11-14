@@ -100,6 +100,18 @@ class TestMulti(unittest.TestCase):
         self.assertEqual(second.calls[-1], ("get", "me@example.com", "E1"))
         self.assertEqual(first.calls, [("calendars",)])
 
+    def test_a_calendar_two_accounts_see_shows_once_under_one_that_may_write_it(self):
+        reader = Fake("gws", [calendar("team@example.com", writable=False), calendar("a@example.com")])
+        owner = Fake("gws", [calendar("team@example.com"), calendar("a@example.com")])
+        both = multi.Multi([reader, owner])
+        listed = both.calendars()
+        self.assertEqual([(c["id"], c["writable"]) for c in listed],
+                         [("team@example.com", True), ("a@example.com", True)])
+        both.update("team@example.com", "E1", {})
+        both.update("a@example.com", "E2", {})
+        self.assertEqual(owner.calls[-1], ("update", "team@example.com", "E1"))
+        self.assertEqual(reader.calls[-1], ("update", "a@example.com", "E2"))
+
     def test_a_calendar_no_backend_lists_is_refused(self):
         first = Fake("caldav", [])
         second = Fake("gws", [])
@@ -145,6 +157,21 @@ class TestBuildClient(unittest.TestCase):
         client = cli.build_client(self.cfg(["gws", "Graph", "gws"]))
         self.assertIsInstance(client, multi.Multi)
         self.assertEqual(client.SOURCE_NAME, "gws+graph")
+
+    def test_several_google_accounts_are_several_clients_under_one_name(self):
+        cfg = {**self.cfg(["gws", "graph"]), "profile": "/p/one", "profiles": ["/p/two", "/p/one"]}
+        client = cli.build_client(cfg)
+        self.assertEqual(client.SOURCE_NAME, "gws+graph")
+        self.assertEqual([one.profile for one in client._clients[:-1]], ["/p/one", "/p/two"])
+        alone = cli.build_client({**self.cfg("gws"), "profiles": ["/p/two"]})
+        self.assertIsInstance(alone, multi.Multi)
+        self.assertEqual(alone.SOURCE_NAME, "gws")
+        self.assertIn("/p/two", alone._clients[1].auth_hint(cfg))
+
+    def test_profiles_that_are_not_folder_paths_are_a_config_error(self):
+        for profiles in ("/p/two", [""], [3]):
+            with self.assertRaises(config.ConfigError):
+                cli.build_client({**self.cfg("gws"), "profiles": profiles})
 
     def test_a_list_of_one_is_that_backend(self):
         self.assertEqual(cli.build_client(self.cfg(["graph"])).SOURCE_NAME, "graph")

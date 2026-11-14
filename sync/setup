@@ -29,7 +29,12 @@ set -euo pipefail
 # With the Azure CLI (az) it creates the registration itself; --by-hand
 # prints the steps for the Entra portal instead. The sign-in opens your
 # browser; --device-code shows a code to type on another machine instead.
+#
+# --add-google signs one more Google account in, beside the one the Google
+# setup signed in. It reuses that setup's OAuth client, so there is nothing
+# to do in the Cloud Console: the browser opens, you pick the account.
 WRITE=0
+ADD_GOOGLE=0
 BY_HAND=0
 DEVICE_CODE=0
 ICS=0
@@ -41,9 +46,10 @@ for arg in "$@"; do
     --ics) ICS=1 ;;
     --caldav) CALDAV=1 ;;
     --outlook) OUTLOOK=1 ;;
+    --add-google) ADD_GOOGLE=1 ;;
     --by-hand) BY_HAND=1 ;;
     --device-code) DEVICE_CODE=1 ;;
-    *) echo "unknown option: $arg (expected --write, --ics, --caldav, --outlook, --by-hand or --device-code)"; exit 2 ;;
+    *) echo "unknown option: $arg (expected --write, --ics, --caldav, --outlook, --add-google, --by-hand or --device-code)"; exit 2 ;;
   esac
 done
 
@@ -572,7 +578,7 @@ pause() {
 [ "$ICS" = 1 ] && setup_ics
 [ "$CALDAV" = 1 ] && setup_caldav
 
-if [ ! -t 0 ]; then
+if [ ! -t 0 ] && [ "$ADD_GOOGLE" = 0 ]; then
   cat <<'EOF'
 Warning: stdin is not a terminal.
 
@@ -640,6 +646,86 @@ EOF
     exit 1
     ;;
 esac
+# One more Google account, beside the one already signed in.
+add_google() {
+  step "Adding another Google account"
+  [ -f "$PROFILE/client_secret.json" ] || {
+    echo "  Run this setup once without --add-google first: the first account's"
+    echo "  setup creates the OAuth client the others sign in with."
+    exit 1
+  }
+  local number=2 added
+  while [ -e "$PROFILE-$number" ]; do number=$((number + 1)); done
+  added="$PROFILE-$number"
+  mkdir -p "$added"
+  chmod 700 "$added"
+  # Until the config names it, a folder from a sign-in that failed is litter.
+  trap 'rm -rf "$added"; rm -f "${candidate:-}"' EXIT
+  cp "$PROFILE/client_secret.json" "$added/client_secret.json"
+  chmod 600 "$added/client_secret.json"
+
+  cat <<'EOF'
+  Your browser opens: pick the account to add, not the one already here.
+  On the consent screen, TICK THE CHECKBOXES for your calendars before
+  clicking Continue. They are not ticked for you.
+
+  An account outside your organisation is refused if the consent screen's
+  audience is "Internal"; it has to be "External" and published.
+EOF
+  GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$added" "$GWS" auth login --scopes "$SCOPES" || {
+    echo "  The sign-in failed, see above. Nothing changed."
+    exit 1
+  }
+  local granted wanted
+  granted=$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$added" "$GWS" auth status 2>/dev/null || true)
+  for wanted in ${SCOPES//,/ }; do
+    case "$granted" in
+      *"\"$wanted\""*) echo "  ${wanted##*/} granted" ;;
+      *)
+        echo "  The scope ${wanted##*/} was NOT granted: its checkbox on the consent"
+        echo "  screen was left unticked. Run this again and tick it. Nothing changed."
+        exit 1
+        ;;
+    esac
+  done
+
+  # The new config replaces the current one only after a test sync passes.
+  mkdir -p "$(dirname "$CONFIG")"
+  candidate=$(mktemp "$CONFIG.XXXXXX")
+  python3 - "$CONFIG" "$candidate" "$added" "$WRITE" <<'PYEOF'
+import json, os, pathlib, sys
+
+path, candidate, added, write = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+config = json.loads(path.read_text())
+more = [one for one in config.get("profiles") or [] if isinstance(one, str)]
+config["profiles"] = more + [added]
+config["write"] = write
+fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(json.dumps(config, indent=2) + "\n")
+print("  Google accounts:", 1 + len(config["profiles"]))
+PYEOF
+  step "Testing the sync"
+  "$SYNC_BIN" --config "$candidate" || {
+    echo "  The sync failed, see above. $CONFIG is unchanged."
+    exit 1
+  }
+  mv -f "$candidate" "$CONFIG"
+  trap - EXIT
+  install_timer_and_sync
+  exit 0
+}
+
+if [ "$ADD_GOOGLE" = 1 ]; then
+  python3 - "$CONFIG" <<'PYEOF' || { echo "Google is not set up yet. Run this setup without --add-google first."; exit 1; }
+import json, pathlib, sys
+config = json.loads(pathlib.Path(sys.argv[1]).read_text())
+named = config.get("backend") or "gws"
+sys.exit(0 if "gws" in (named if isinstance(named, list) else [named]) and config.get("gwsPath") else 1)
+PYEOF
+  add_google
+fi
+
 command -v gcloud >/dev/null || { echo "gcloud is required for automated project setup"; exit 1; }
 
 step "Using an isolated gcloud configuration so your other projects are untouched"

@@ -505,6 +505,22 @@ as an expired sign-in, costs its own calendars until it is fixed, and the
 others keep syncing; `systemctl --user status omarchy-calendar-sync.service`
 shows which one was skipped.
 
+### Several Google accounts
+
+After the Google setup has signed the first account in, each further one
+is a single browser sign-in, with nothing to do in the Cloud Console:
+
+```bash
+~/.config/omarchy/plugins/tmn73.calendar/sync/setup --add-google
+```
+
+It reuses the first account's OAuth client, keeps the new sign-in in a
+folder of its own (`~/.config/gws-omarchy-calendar-2`, `-3`, ...) and lists
+it under `"profiles"` in the config. An account outside your organisation
+needs the consent screen's audience to be External and published. A
+calendar two accounts both see shows once, under an account that may write
+it. To remove an account, delete its line from `"profiles"` and its folder.
+
 ## Use another source
 
 The widget has no idea Google exists. It reads one file and renders it:
