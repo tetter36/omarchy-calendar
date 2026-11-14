@@ -30,11 +30,17 @@ set -euo pipefail
 # prints the steps for the Entra portal instead. The sign-in opens your
 # browser; --device-code shows a code to type on another machine instead.
 #
+# --add-outlook signs one more Outlook account in, beside the first. An
+# account in the same organisation reuses the app registration; another
+# organisation gets one of its own. --outlook=2 signs account 2 in again.
+#
 # --add-google signs one more Google account in, beside the one the Google
 # setup signed in. It reuses that setup's OAuth client, so there is nothing
 # to do in the Cloud Console: the browser opens, you pick the account.
 WRITE=0
 ADD_GOOGLE=0
+OUTLOOK_ADD=0
+OUTLOOK_ACCOUNT=""
 BY_HAND=0
 DEVICE_CODE=0
 ICS=0
@@ -47,9 +53,11 @@ for arg in "$@"; do
     --caldav) CALDAV=1 ;;
     --outlook) OUTLOOK=1 ;;
     --add-google) ADD_GOOGLE=1 ;;
+    --add-outlook) OUTLOOK=1; OUTLOOK_ADD=1 ;;
+    --outlook=*) OUTLOOK=1; OUTLOOK_ACCOUNT=${arg#--outlook=} ;;
     --by-hand) BY_HAND=1 ;;
     --device-code) DEVICE_CODE=1 ;;
-    *) echo "unknown option: $arg (expected --write, --ics, --caldav, --outlook, --add-google, --by-hand or --device-code)"; exit 2 ;;
+    *) echo "unknown option: $arg (expected --write, --ics, --caldav, --outlook, --add-outlook, --add-google, --by-hand or --device-code)"; exit 2 ;;
   esac
 done
 
@@ -428,6 +436,28 @@ outlook_register() {
   REGISTERED_TENANT=$tenant
 }
 
+# One value of one Outlook account in the config: the first account is "",
+# and the key "next" is the label a further account would get.
+outlook_entry() {
+  python3 -c '
+import json, pathlib, sys
+try:
+    held = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("graph")
+except (OSError, ValueError, AttributeError):
+    held = None
+held = held if isinstance(held, list) else [held]
+entries = [one for one in held if isinstance(one, dict)]
+labels = [str(one.get("account") or "") for one in entries]
+if sys.argv[3] == "next":
+    number = 2
+    while str(number) in labels:
+        number += 1
+    print(number)
+elif sys.argv[2] in labels:
+    print(entries[labels.index(sys.argv[2])].get(sys.argv[3]) or "")
+' "$CONFIG" "$1" "$2" 2>/dev/null || true
+}
+
 setup_outlook() {
   step "Reading and writing Outlook over Microsoft Graph"
   command -v secret-tool >/dev/null || {
@@ -436,24 +466,42 @@ setup_outlook() {
   }
 
   # A second run offers what the config already holds.
-  local current_client current_tenant
-  current_client=$(python3 -c '
-import json, pathlib, sys
-try:
-    print((json.loads(pathlib.Path(sys.argv[1]).read_text()).get("graph") or {}).get(sys.argv[2]) or "")
-except (OSError, ValueError, AttributeError):
-    print("")
-' "$CONFIG" clientId 2>/dev/null || true)
-  current_tenant=$(python3 -c '
-import json, pathlib, sys
-try:
-    print((json.loads(pathlib.Path(sys.argv[1]).read_text()).get("graph") or {}).get(sys.argv[2]) or "")
-except (OSError, ValueError, AttributeError):
-    print("")
-' "$CONFIG" tenant 2>/dev/null || true)
+  local current_client current_tenant account="$OUTLOOK_ACCOUNT"
+  current_client=$(outlook_entry "$account" clientId)
+  current_tenant=$(outlook_entry "$account" tenant)
 
   local client_id="" tenant=""
-  if [ -n "$current_client" ] && [ -n "$current_tenant" ]; then
+  if [ "$OUTLOOK_ADD" = 1 ]; then
+    [ -n "$(outlook_entry "" clientId)" ] || {
+      echo "  Outlook is not set up yet. Run this setup with --outlook first."
+      exit 1
+    }
+    account=$(outlook_entry "" next)
+    local same=y
+    if [ -t 0 ]; then
+      read -r -p "  Is this account in the same organisation as the first one? [Y/n] " same || true
+    fi
+    case "${same:-y}" in
+      n|N|no|No|NO)
+        # Another organisation needs an app registration of its own.
+        echo "  Then sign in below with an administrator of that organisation."
+        current_client=""
+        current_tenant=""
+        ;;
+      *)
+        client_id=$(outlook_entry "" clientId)
+        tenant=$(outlook_entry "" tenant)
+        ;;
+    esac
+  elif [ -n "$account" ]; then
+    [ -n "$current_client" ] || { echo "  There is no Outlook account $account in $CONFIG."; exit 1; }
+    client_id=$current_client
+    tenant=$current_tenant
+  fi
+
+  if [ -n "$client_id" ]; then
+    :
+  elif [ -n "$current_client" ] && [ -n "$current_tenant" ]; then
     # Registered before: only the sign-in is left, Enter keeps both.
     echo "  Using the app registration from the last setup. Enter keeps it."
   elif [ "$BY_HAND" = 0 ] && outlook_have_az; then
@@ -505,6 +553,8 @@ except (OSError, ValueError, AttributeError):
   local login_args=(login --client-id "$client_id" --tenant "$tenant")
   [ "$WRITE" = 1 ] && login_args+=(--write)
   [ "$DEVICE_CODE" = 1 ] && login_args+=(--device-code)
+  [ -n "$account" ] && login_args+=(--account "$account")
+  [ -z "$account" ] || echo "  Pick the account to add in the browser, not one already here."
   # No .pyc: the shell reloads the plugin when its folder changes.
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" python3 -m omarchy_calendar_sync.graph "${login_args[@]}" || {
     echo "  The sign-in failed, see above. $CONFIG is unchanged."
@@ -516,11 +566,11 @@ except (OSError, ValueError, AttributeError):
   local candidate
   candidate=$(mktemp "$CONFIG.XXXXXX")
   trap 'rm -f "$candidate"' EXIT
-  python3 - "$CONFIG" "$candidate" "$client_id" "$tenant" "$WRITE" <<'PYEOF'
+  python3 - "$CONFIG" "$candidate" "$client_id" "$tenant" "$WRITE" "$account" <<'PYEOF'
 import json, os, pathlib, sys
 
 path, candidate = pathlib.Path(sys.argv[1]), sys.argv[2]
-client_id, tenant, write = sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+client_id, tenant, write, account = sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6]
 config = {}
 if path.exists():
     try:
@@ -538,8 +588,19 @@ else:
     names = ["gws"] if config.get("gwsPath") else []
 names = [name for name in names if name != "graph"] + ["graph"]
 config["backend"] = names if len(names) > 1 else "graph"
-config["graph"] = {"clientId": client_id, "tenant": tenant}
+# One account is an object, as it always was; several are a list of them.
+held = config.get("graph")
+held = held if isinstance(held, list) else [held] if isinstance(held, dict) else []
+entries = [one for one in held if isinstance(one, dict) and str(one.get("account") or "") != account]
+entry = {"clientId": client_id, "tenant": tenant}
+if account:
+    entry["account"] = account
+    entries.append(entry)
+else:
+    entries.insert(0, entry)
+config["graph"] = entries[0] if len(entries) == 1 and not account else entries
 config["write"] = write
+print("  Outlook accounts:", len(entries))
 fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as stream:
     stream.write(json.dumps(config, indent=2) + "\n")
@@ -549,7 +610,7 @@ print("  write set to", write)
 PYEOF
 
   step "Testing the sync"
-  "$SYNC_BIN" --config "$candidate" || {
+  OMARCHY_CALENDAR_STRICT=1 "$SYNC_BIN" --config "$candidate" || {
     echo "  The sync failed, see above. $CONFIG is unchanged."
     exit 1
   }
@@ -706,7 +767,7 @@ with os.fdopen(fd, "w") as stream:
 print("  Google accounts:", 1 + len(config["profiles"]))
 PYEOF
   step "Testing the sync"
-  "$SYNC_BIN" --config "$candidate" || {
+  OMARCHY_CALENDAR_STRICT=1 "$SYNC_BIN" --config "$candidate" || {
     echo "  The sync failed, see above. $CONFIG is unchanged."
     exit 1
   }

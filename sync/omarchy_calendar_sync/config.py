@@ -22,7 +22,9 @@ DEFAULTS = {
     # ["gws", "graph"], reads and writes several as one.
     "backend": "gws",
     # graph only: the app registration sync/setup --outlook signed in with.
-    # The sign-in itself is in the keyring, not here.
+    # The sign-in itself is in the keyring, not here. A list of these, each
+    # after the first with an "account" label, is several Outlook accounts;
+    # sync/setup --add-outlook adds one.
     "graph": {"clientId": "", "tenant": "organizations"},
     # Opt-in. sync/setup --write sets it, together with the calendar.events
     # scope. Off, the sync publishes no writable calendars and the panel

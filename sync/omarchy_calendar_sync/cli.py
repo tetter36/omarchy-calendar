@@ -196,6 +196,11 @@ def build_client(cfg, local_tz=None):
     for name in names:
         if name == "gws":
             clients.extend(Gws(profile, binary=cfg["gwsPath"]) for profile in _profiles(cfg))
+        elif name == "graph" and isinstance(cfg.get("graph"), (list, tuple)):
+            # Several Outlook accounts, each with a sign-in of its own.
+            if not cfg["graph"]:
+                raise config_module.ConfigError("graph is an empty list")
+            clients.extend(Graph(account, local_tz=local_tz) for account in cfg["graph"])
         else:
             clients.append(_build_one(name, cfg, local_tz))
     return clients[0] if len(clients) == 1 else Multi(clients)

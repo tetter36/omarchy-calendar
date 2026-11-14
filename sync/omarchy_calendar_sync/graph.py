@@ -86,6 +86,7 @@ _NOT_SIGNED_IN_PAGE = _SIGNED_IN_PAGE.replace("Signed in", "Not signed in").repl
     "The sign-in did not finish. The terminal says why.")
 
 _CLIENT_ID = re.compile(r"^[0-9a-fA-F-]{32,40}$")
+_ACCOUNT = re.compile(r"^[A-Za-z0-9_-]{0,32}$")
 _TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 _GRAPH_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2})?)")
@@ -185,8 +186,11 @@ class Keyring:
     arguments show to every user on the machine through ps.
     """
 
-    def __init__(self, client_id):
-        self._attributes = ["service", KEYRING_SERVICE, "client", str(client_id)]
+    def __init__(self, client_id, account=""):
+        # A lookup matches every entry that has these attributes, so a
+        # further account is told apart in the value, not by one more.
+        client = "%s/%s" % (client_id, account) if account else str(client_id)
+        self._attributes = ["service", KEYRING_SERVICE, "client", client]
 
     def _run(self, args, text=None):
         try:
@@ -226,6 +230,14 @@ def _settings(raw):
         raise ConfigError("graph.tenant must be a Directory (tenant) ID, a domain, "
                           "or \"organizations\"")
     return client_id, tenant
+
+
+def _account(raw):
+    """Which sign-in of several: "" for the first, a short label after."""
+    account = str((raw if isinstance(raw, dict) else {}).get("account") or "").strip()
+    if not _ACCOUNT.match(account):
+        raise ConfigError("graph.account must be a short label of letters and digits")
+    return account
 
 
 def _token_url(tenant):
@@ -320,7 +332,7 @@ def _open_browser(address):
 
 
 def login_browser(client_id, tenant, write, http=None, store=None, out=None,
-                  open_browser=None, callback=None, clock=time.time):
+                  open_browser=None, callback=None, clock=time.time, account=""):
     """Sign in through the browser on this machine: pick the account there
     and the sign-in lands in the keyring, with nothing to type.
 
@@ -328,7 +340,7 @@ def login_browser(client_id, tenant, write, http=None, store=None, out=None,
     browser is worth nothing without the verifier that never leaves here.
     """
     http = http or _https
-    store = store or Keyring(client_id)
+    store = store or Keyring(client_id, account)
     out = out or sys.stdout
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
@@ -368,7 +380,8 @@ def login_browser(client_id, tenant, write, http=None, store=None, out=None,
     _keep_first(status, reply, store, clock())
 
 
-def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.sleep, clock=time.time):
+def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.sleep,
+          clock=time.time, account=""):
     """Sign in with the device code flow and keep the result in the keyring.
 
     Prints the address and the code to type there, then waits for the
@@ -376,7 +389,7 @@ def login(client_id, tenant, write, http=None, store=None, out=None, sleep=time.
     machine with no browser of its own; login_browser is the usual way.
     """
     http = http or _https
-    store = store or Keyring(client_id)
+    store = store or Keyring(client_id, account)
     out = out or sys.stdout
 
     status, reply = _form(http, f"{LOGIN}/{_quote(tenant)}/oauth2/v2.0/devicecode",
@@ -815,9 +828,10 @@ class Graph:
 
     def __init__(self, settings, local_tz=None, http=None, store=None, clock=time.time):
         self.client_id, self.tenant = _settings(settings)
+        self.account = _account(settings)
         self._local_tz = local_tz or timezone.utc
         self._http = http or _https
-        self._store = store or Keyring(self.client_id)
+        self._store = store or Keyring(self.client_id, self.account)
         self._clock = clock
         self._access_token = None
         self._calendars = {}
@@ -835,7 +849,14 @@ class Graph:
         self._token()
 
     def auth_hint(self, _cfg):
-        return "if this is a sign-in error, run sync/setup --outlook"
+        return self._named("if this is a sign-in error, run sync/setup --outlook.")[:-1]
+
+    def _named(self, message):
+        """A sign-in message, naming the account when there are several."""
+        if not self.account:
+            return message
+        return (message.replace("sign-in", "sign-in (account %s)" % self.account, 1)
+                .replace("--outlook.", "--outlook=%s." % self.account))
 
     # -- reading
 
@@ -968,7 +989,7 @@ class Graph:
         error = error if isinstance(error, dict) else {}
         message = str(error.get("message") or "").strip() or f"HTTP {status}"
         if status == 401:
-            raise GraphSignInError(SIGN_IN_EXPIRED)
+            raise GraphSignInError(self._named(SIGN_IN_EXPIRED))
         if status == 404 or error.get("code") == "ErrorItemNotFound":
             raise GraphNotFound(f"404: {message}")
         if status == 403:
@@ -984,7 +1005,7 @@ class Graph:
             return self._access_token
         kept = self._store.load()
         if not kept or not kept.get("refresh_token"):
-            raise GraphSignInError(NO_SIGN_IN)
+            raise GraphSignInError(self._named(NO_SIGN_IN))
         try:
             lasts = float(kept.get("expires_at") or 0) - self._clock()
         except (TypeError, ValueError):
@@ -996,7 +1017,7 @@ class Graph:
 
     def _renew(self, kept):
         if not kept.get("refresh_token"):
-            raise GraphSignInError(NO_SIGN_IN)
+            raise GraphSignInError(self._named(NO_SIGN_IN))
         status, reply = _form(self._http, _token_url(self.tenant), {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
@@ -1007,7 +1028,7 @@ class Graph:
             # invalid_grant: the sign-in expired, was revoked, or the
             # organisation's policy asks for a new one.
             if status in (400, 401) or reply.get("error") == "invalid_grant":
-                raise GraphSignInError(SIGN_IN_EXPIRED)
+                raise GraphSignInError(self._named(SIGN_IN_EXPIRED))
             raise GraphError(f"Microsoft answered the sign-in renewal with HTTP {status}")
         self._store.save(_kept(reply, kept, self._clock()))
         self._access_token = token
@@ -1035,6 +1056,7 @@ def main(argv=None):
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--tenant", default="organizations")
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--account", default="", help="a further account's label")
     parser.add_argument("--device-code", action="store_true",
                         help="type a code in a browser on any machine, for one with no browser")
     args = parser.parse_args(argv)
@@ -1042,10 +1064,11 @@ def main(argv=None):
     desktop = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
     try:
         client_id, tenant = _settings({"clientId": args.client_id, "tenant": args.tenant})
+        account = _account({"account": args.account})
         if args.device_code or not desktop:
-            login(client_id, tenant, args.write)
+            login(client_id, tenant, args.write, account=account)
         else:
-            login_browser(client_id, tenant, args.write)
+            login_browser(client_id, tenant, args.write, account=account)
     except (ConfigError, SyncError) as error:
         print(str(error), file=sys.stderr)
         return 1

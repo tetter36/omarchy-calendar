@@ -7,6 +7,7 @@ backend only. A backend that fails (an expired sign-in, a server that is
 down) costs its own calendars for that sync, not the others'.
 """
 
+import os
 import sys
 
 from .errors import SyncError
@@ -94,6 +95,9 @@ class Multi:
         return "\n".join(hint for hint in hints if hint)
 
     def _skip(self, client, error):
+        # A setup's test sync must not pass over the account it just added.
+        if os.environ.get("OMARCHY_CALENDAR_STRICT"):
+            raise error
         self._failed.append(client)
         print(f"skipping {client.SOURCE_NAME}: {error}", file=sys.stderr)
 
@@ -109,16 +113,18 @@ class Multi:
         only when several cannot are the calendars listed."""
         if calendar_id in self._owners:
             return self._owners[calendar_id]
-        rest = []
+        claimed, rest = [], []
         for client in self._clients:
             owns = getattr(client, "owns", None)
             if owns is None:
                 rest.append(client)
             elif owns(calendar_id):
-                return client
-        if len(rest) == 1:
-            return rest[0]
-        if rest:
+                claimed.append(client)
+        # Two accounts of one backend both know the id as theirs.
+        among = claimed or rest
+        if len(among) == 1:
+            return among[0]
+        if among:
             self.calendars()
             if calendar_id in self._owners:
                 return self._owners[calendar_id]

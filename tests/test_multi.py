@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 from omarchy_calendar_sync import cli, config, multi
 from omarchy_calendar_sync.errors import SyncError
@@ -112,6 +114,21 @@ class TestMulti(unittest.TestCase):
         self.assertEqual(owner.calls[-1], ("update", "team@example.com", "E1"))
         self.assertEqual(reader.calls[-1], ("update", "a@example.com", "E2"))
 
+    def test_two_accounts_of_a_backend_that_knows_its_ids_are_told_apart_by_listing(self):
+        first = Prefixed("graph", [calendar("graph:CAL1")])
+        second = Prefixed("graph", [calendar("graph:CAL2")])
+        google = Fake("gws", [calendar("me@example.com")])
+        all_three = multi.Multi([google, first, second])
+        all_three.update("graph:CAL2", "E1", {})
+        self.assertEqual(second.calls[-1], ("update", "graph:CAL2", "E1"))
+        self.assertNotIn(("update", "graph:CAL2", "E1"), first.calls)
+
+    def test_a_setups_test_sync_does_not_pass_over_a_failed_account(self):
+        _google, _graph, both = pair(fail_check=SyncError("expired"))
+        with mock.patch.dict(os.environ, {"OMARCHY_CALENDAR_STRICT": "1"}):
+            with self.assertRaises(SyncError):
+                both.check()
+
     def test_a_calendar_no_backend_lists_is_refused(self):
         first = Fake("caldav", [])
         second = Fake("gws", [])
@@ -172,6 +189,20 @@ class TestBuildClient(unittest.TestCase):
         for profiles in ("/p/two", [""], [3]):
             with self.assertRaises(config.ConfigError):
                 cli.build_client({**self.cfg("gws"), "profiles": profiles})
+
+    def test_several_outlook_accounts_are_several_clients_with_their_own_sign_ins(self):
+        accounts = [self.GRAPH, {**self.GRAPH, "account": "2"}]
+        client = cli.build_client({**self.cfg("graph"), "graph": accounts})
+        self.assertIsInstance(client, multi.Multi)
+        self.assertEqual(client.SOURCE_NAME, "graph")
+        self.assertEqual([one.account for one in client._clients], ["", "2"])
+        first, second = (one._store._attributes[-1] for one in client._clients)
+        self.assertEqual(second, first + "/2")
+        self.assertEqual(client._clients[1].auth_hint({}), "if this is a sign-in (account 2) error, "
+                                                           "run sync/setup --outlook=2")
+        for bad in ([], [{**self.GRAPH, "account": "two words"}]):
+            with self.assertRaises(config.ConfigError):
+                cli.build_client({**self.cfg("graph"), "graph": bad})
 
     def test_a_list_of_one_is_that_backend(self):
         self.assertEqual(cli.build_client(self.cfg(["graph"])).SOURCE_NAME, "graph")

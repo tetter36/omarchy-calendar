@@ -136,6 +136,15 @@ class TestSignIn(unittest.TestCase):
             client(http).calendars()
         self.assertEqual(len(http.calls), 3)
 
+    def test_a_further_accounts_messages_name_it(self):
+        http = FakeHttp((400, {"error": "invalid_grant"}))
+        store = FakeStore({"refresh_token": "R1", "access_token": "A1", "expires_at": 0})
+        second = graph.Graph({**SETTINGS, "account": "2"}, http=http, store=store, clock=lambda: 1_000)
+        with self.assertRaises(graph.GraphSignInError) as caught:
+            second.calendars()
+        self.assertEqual(str(caught.exception),
+                         "Your Outlook sign-in (account 2) expired. Run sync/setup --outlook=2.")
+
     def test_no_message_quotes_a_token(self):
         http = FakeHttp((500, {"error": {"message": "boom"}}))
         with self.assertRaises(graph.GraphError) as caught:

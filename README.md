@@ -505,6 +505,21 @@ as an expired sign-in, costs its own calendars until it is fixed, and the
 others keep syncing; `systemctl --user status omarchy-calendar-sync.service`
 shows which one was skipped.
 
+### Several Outlook accounts
+
+```bash
+~/.config/omarchy/plugins/tmn73.calendar/sync/setup --add-outlook
+```
+
+An account in the same organisation as the first reuses its app
+registration, so it is one browser sign-in. For another organisation,
+answer "n" to the first question: that organisation gets a registration of
+its own, created by one of its administrators the same way as the first.
+The accounts are a list under `"graph"`, each after the first with an
+`"account"` label; `sync/setup --outlook=2` signs account 2 in again. A
+personal outlook.com account is not covered: the registrations made here
+are for one organisation each.
+
 ### Several Google accounts
 
 After the Google setup has signed the first account in, each further one

@@ -208,6 +208,52 @@ class SetupOutlookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.az_calls(), [])
 
+    def test_a_second_account_in_the_same_organisation_reuses_the_registration(self):
+        self.write_config({"backend": ["gws", "graph"], "gwsPath": "/usr/bin/gws", "write": True,
+                           "graph": {"clientId": CLIENT, "tenant": TENANT}})
+        result = self.run_with_az("", "--add-outlook")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        config = self.read_config()
+        self.assertEqual(config["graph"], [{"clientId": CLIENT, "tenant": TENANT},
+                                           {"clientId": CLIENT, "tenant": TENANT, "account": "2"}])
+        self.assertEqual(config["backend"], ["gws", "graph"])
+        self.assertEqual(json.loads(self.log.read_text()),
+                         ["login", "--client-id", CLIENT, "--tenant", TENANT, "--write", "--account", "2"])
+        self.assertEqual(self.az_calls(), [])
+
+    def test_a_third_account_and_signing_one_in_again_keep_the_list(self):
+        self.write_config({"backend": "graph", "write": True, "graph": {"clientId": CLIENT, "tenant": TENANT}})
+        self.run_setup("", "--add-outlook")
+        self.run_setup("", "--add-outlook")
+        self.assertEqual([one.get("account") for one in self.read_config()["graph"]], [None, "2", "3"])
+        result = self.run_setup("", "--outlook=2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([one.get("account") for one in self.read_config()["graph"]], [None, "3", "2"])
+        self.assertEqual(json.loads(self.log.read_text())[-2:], ["--account", "2"])
+        # The first account again: the list stays, and it stays first.
+        result = self.run_setup("\n\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([one.get("account") for one in self.read_config()["graph"]], [None, "3", "2"])
+        self.assertNotIn("--account", json.loads(self.log.read_text()))
+
+    def test_adding_before_the_first_account_or_naming_one_that_is_not_there_changes_nothing(self):
+        result = self.run_setup("", "--add-outlook")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.config.exists())
+        before = {"backend": "graph", "write": True, "graph": {"clientId": CLIENT, "tenant": TENANT}}
+        self.write_config(before)
+        result = self.run_setup("", "--outlook=7")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.read_config(), before)
+        self.assertFalse(self.log.exists())
+
+    def test_a_failed_test_sync_does_not_add_the_account(self):
+        before = {"backend": "graph", "write": True, "graph": {"clientId": CLIENT, "tenant": TENANT}}
+        self.write_config(before)
+        result = self.run_setup("", "--add-outlook", FAKE_FAIL="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.read_config(), before)
+
     def test_the_device_code_flag_reaches_the_sign_in(self):
         self.run_setup(CLIENT + "\ncontoso.example\n", "--device-code")
         self.assertIn("--device-code", json.loads(self.log.read_text()))
