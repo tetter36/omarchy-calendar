@@ -505,6 +505,15 @@ as an expired sign-in, costs its own calendars until it is fixed, and the
 others keep syncing; `systemctl --user status omarchy-calendar-sync.service`
 shows which one was skipped.
 
+### Add an account from the panel
+
+Settings (the gear in the panel) has an **Accounts** section. It lists the
+connected Google and Outlook accounts, each with its address and whether
+its sign-in still works. Pick a kind, click **Connect**, and a terminal
+window opens on the setup with the right option: the full setup for the
+first account of a kind, a single browser sign-in for the ones after it.
+The list updates when the setup finishes.
+
 ### Several Outlook accounts
 
 ```bash

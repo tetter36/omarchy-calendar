@@ -175,6 +175,41 @@ Panel {
   readonly property string eventCommand: Model.localPathFromUrl(
     Qt.resolvedUrl("sync/omarchy-calendar-event"))
 
+  // The same rule for the command that lists and connects accounts.
+  readonly property string accountCommand: Model.localPathFromUrl(
+    Qt.resolvedUrl("sync/omarchy-calendar-account"))
+  property var accounts: []
+  property bool accountsLoading: false
+  // "" | "opened" | an error from the command, shown as it is.
+  property string accountNotice: ""
+
+  // Asks every account for its address, so it takes a second or two.
+  function listAccounts() {
+    if (accountLister.running) return
+    root.accountsLoading = true
+    accountLister.stdinEnabled = true
+    accountLister.command = [root.accountCommand]
+    accountLister.running = true
+  }
+
+  function connectAccount(kind) {
+    if (accountConnector.running) return
+    root.accountNotice = ""
+    accountConnector.request = JSON.stringify({ action: "connect", type: String(kind) })
+    accountConnector.stdinEnabled = true
+    accountConnector.command = [root.accountCommand]
+    accountConnector.running = true
+  }
+
+  function accountReply(text) {
+    try {
+      var reply = JSON.parse(text)
+      return reply && typeof reply === "object" ? reply : {}
+    } catch (error) {
+      return {}
+    }
+  }
+
   // ---- The selected day and event.
   property string selectedDayKey: todayKey
   readonly property bool selectedIsToday: selectedDayKey === todayKey
@@ -831,7 +866,45 @@ Panel {
     printErrors: false
     onLoaded: root.applyEvents(text())
     onLoadFailed: root.applyEvents("")
-    onFileChanged: reload()
+    onFileChanged: {
+      reload()
+      // A setup that just finished ends with a sync, which lands here.
+      if (root.settingsOpen) root.listAccounts()
+    }
+  }
+
+  Process {
+    id: accountLister
+    onStarted: {
+      write('{"action": "list"}')
+      accountLister.stdinEnabled = false
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.accountReply(text)
+        if (Array.isArray(reply.accounts)) root.accounts = reply.accounts
+        root.accountsLoading = false
+      }
+    }
+    // A command that could not start reports no stream.
+    onExited: root.accountsLoading = false
+  }
+
+  Process {
+    id: accountConnector
+    property string request: ""
+    onStarted: {
+      write(accountConnector.request)
+      accountConnector.stdinEnabled = false
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.accountReply(text)
+        root.accountNotice = reply.ok === true ? "opened" : String(reply.error || root.tr("accounts.failed"))
+      }
+    }
   }
 
   // Closing stdin right after the text is the end of input wl-copy reads up to.
@@ -1104,6 +1177,11 @@ Panel {
                 syncedAt: root.eventDoc && root.eventDoc.syncedAt
                   ? root.uiLocale.toString(new Date(root.eventDoc.syncedAt), "d MMM HH:mm")
                   : ""
+                accounts: root.accounts
+                accountsLoading: root.accountsLoading
+                accountNotice: root.accountNotice
+                onAccountsRequested: root.listAccounts()
+                onAccountConnectRequested: function(kind) { root.connectAccount(kind) }
                 onSetupCommandCopyRequested: root.copySetupCommand()
                 onWriteSetupCopyRequested: root.copyWriteSetupCommand()
                 onCloseRequested: root.settingsOpen = false

@@ -46,6 +46,11 @@ Item {
   property bool showWorkingLocation: false
   property bool hideDeclined: false
 
+  // Accounts
+  property var accounts: []
+  property bool accountsLoading: false
+  property string accountNotice: ""
+
   // General
   // The stored setting ("auto" | "en" | "pt"), not the resolved language.
   property string languageSetting: "auto"
@@ -62,6 +67,9 @@ Item {
   property bool setupCommandCopied: false
 
   signal closeRequested()
+  // The Accounts section came up, so its list is wanted fresh.
+  signal accountsRequested()
+  signal accountConnectRequested(string kind)
   // The settings to store as they are, for example { reminders: false }.
   signal picked(var values)
   // A text field let go of the keys, so the panel can take them back.
@@ -82,6 +90,7 @@ Item {
     { id: "panel", icon: "󰕭", label: "settings.sectionPanel" },
     { id: "bar", icon: "󰅐", label: "settings.sectionBar" },
     { id: "calendars", icon: "󰃭", label: "settings.calendars" },
+    { id: "accounts", icon: "󰀄", label: "settings.accounts" },
     { id: "general", icon: "󰒓", label: "settings.sectionGeneral" }
   ]
 
@@ -92,7 +101,12 @@ Item {
   implicitHeight: Style.space(500)
 
   // A new section starts at its top.
-  onSectionChanged: content.contentY = 0
+  // Settings opened again on the section it was left on.
+  onVisibleChanged: if (visible && section === "accounts") root.accountsRequested()
+  onSectionChanged: {
+    content.contentY = 0
+    if (section === "accounts") root.accountsRequested()
+  }
 
   Item {
     id: header
@@ -271,6 +285,18 @@ Item {
         onCalendarToggled: function(calendarId) { root.calendarToggled(calendarId) }
         onWorkingLocationToggled: root.workingLocationToggled()
         onHideDeclinedToggled: root.hideDeclinedToggled()
+      }
+
+      AccountSettings {
+        visible: root.section === "accounts"
+        width: parent.width
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        language: root.language
+        accounts: root.accounts
+        loading: root.accountsLoading
+        notice: root.accountNotice
+        onConnectRequested: function(kind) { root.accountConnectRequested(kind) }
       }
 
       GeneralSettings {
